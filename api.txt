@@ -1,0 +1,248 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import pandas as pd
+import numpy as np
+import joblib
+import os
+import requests as req
+from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score
+from imblearn.over_sampling import SMOTE
+from typing import List
+from dotenv import load_dotenv
+
+os.chdir(r"C:\Users\HP\Desktop\fraud_drift_project")
+load_dotenv(r"C:\Users\HP\Desktop\fraud_drift_project\.env", override=True)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+app = FastAPI(
+    title="Adaptive Drift Monitor API",
+    description="ML Model Monitoring & Drift Detection REST API with Live Supabase Integration",
+    version="3.0"
+)
+
+model    = joblib.load("fraud_model.pkl")
+baseline = pd.read_csv("week1_baseline.csv")
+target   = "Class"
+features = [col for col in baseline.columns if col != target]
+
+
+def get_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
+def fetch_live_data(limit=1000):
+    try:
+        response = req.get(
+            f"{SUPABASE_URL}/rest/v1/transactions?select=*&limit={limit}",
+            headers=get_headers(),
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0:
+                df = pd.DataFrame(data)
+                for col in df.columns:
+                    try:
+                        df[col] = df[col].astype(str).str.strip()
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    except Exception:
+                        pass
+                df = df.fillna(0)
+                return df, None
+        return None, f"Error {response.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+
+def insert_live_data(records):
+    try:
+        headers = get_headers()
+        headers["Prefer"] = "return=minimal"
+        response = req.post(
+            f"{SUPABASE_URL}/rest/v1/transactions",
+            headers=headers,
+            json=records,
+            timeout=10
+        )
+        return response.status_code == 201
+    except Exception:
+        return False
+
+
+class Transaction(BaseModel):
+    features: List[float]
+
+
+class DriftRequest(BaseModel):
+    limit: int = 1000
+    use_live_data: bool = True
+    noise_level: float = 3.0
+
+
+class SimulateRequest(BaseModel):
+    rows: int = 50
+    drift: bool = False
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "Adaptive Drift Monitor API",
+        "version": "3.0",
+        "status": "running",
+        "database": "Supabase PostgreSQL (Live)",
+        "endpoints": ["/health", "/predict", "/detect-drift", "/retrain", "/live-data", "/simulate"]
+    }
+
+
+@app.get("/health")
+def health():
+    db_status = "connected"
+    row_count = 0
+    try:
+        df, err = fetch_live_data(limit=5)
+        if err:
+            db_status = f"error: {err}"
+        else:
+            row_count = len(df) if df is not None else 0
+    except Exception:
+        db_status = "disconnected"
+    return {
+        "status": "healthy",
+        "model": "Random Forest Classifier",
+        "features": len(features),
+        "baseline_rows": len(baseline),
+        "database": db_status,
+        "live_rows_fetched": row_count
+    }
+
+
+@app.get("/live-data")
+def get_live_data(limit: int = 10):
+    df, err = fetch_live_data(limit=limit)
+    if err or df is None:
+        raise HTTPException(status_code=500, detail=str(err))
+    return {
+        "rows": df.shape[0],
+        "columns": df.shape[1],
+        "sample": df.head(5).fillna(0).to_dict(orient="records")
+    }
+
+
+@app.post("/simulate")
+def simulate_data(request: SimulateRequest):
+    sample = baseline.sample(request.rows).copy()
+    if request.drift:
+        for col in features[:3]:
+            sample[col] = sample[col] + np.random.normal(3.0, 2.0, len(sample))
+    records = sample.fillna(0).to_dict(orient="records")
+    success = insert_live_data(records)
+    if success:
+        return {
+            "status": "success",
+            "rows_inserted": request.rows,
+            "drift_injected": request.drift,
+            "message": f"{'Drifted' if request.drift else 'Normal'} data inserted!"
+        }
+    raise HTTPException(status_code=500, detail="Insert failed!")
+
+
+@app.post("/predict")
+def predict(transaction: Transaction):
+    if len(transaction.features) != len(features):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {len(features)} features, got {len(transaction.features)}"
+        )
+    X = np.array(transaction.features).reshape(1, -1)
+    prediction  = model.predict(X)[0]
+    probability = model.predict_proba(X)[0]
+    return {
+        "prediction": "FRAUD" if prediction == 1 else "NORMAL",
+        "fraud_probability":  round(float(probability[1]), 4),
+        "normal_probability": round(float(probability[0]), 4),
+        "confidence": round(float(max(probability)), 4)
+    }
+
+
+@app.post("/detect-drift")
+def detect_drift(request: DriftRequest):
+    reference = baseline[features].head(request.limit).copy()
+    reference = reference.apply(pd.to_numeric, errors='coerce').fillna(0)
+
+    data_source = "simulated"
+    current_df  = None
+
+    if request.use_live_data and SUPABASE_KEY:
+        live_df, err = fetch_live_data(limit=request.limit)
+        if err is None and live_df is not None:
+            available  = [f for f in features if f in live_df.columns]
+            current_df = live_df[available].copy()
+            current_df = current_df.apply(pd.to_numeric, errors='coerce').fillna(0)
+            data_source = "live Supabase database"
+
+    if current_df is None:
+        current_df = reference.copy()
+        for col in features[:3]:
+            current_df[col] = current_df[col] + np.random.normal(
+                request.noise_level, 2.0, len(current_df)
+            )
+        data_source = "simulated"
+
+    drift_results = []
+    for feat in features[:10]:
+        if feat in current_df.columns:
+            try:
+                ref_vals = reference[feat].dropna().astype(float)
+                cur_vals = current_df[feat].dropna().astype(float)
+                ks_stat, p_val = stats.ks_2samp(ref_vals, cur_vals)
+                drift_results.append({
+                    "feature":      feat,
+                    "ks_statistic": round(float(ks_stat), 4),
+                    "p_value":      round(float(p_val), 6),
+                    "drift":        bool(ks_stat > 0.1)
+                })
+            except Exception:
+                continue
+
+    drifted = sum(1 for r in drift_results if r["drift"])
+    avg_ks  = round(np.mean([r["ks_statistic"] for r in drift_results]), 4) if drift_results else 0
+
+    return {
+        "drift_detected":   drifted > 0,
+        "drifted_features": drifted,
+        "total_features":   len(drift_results),
+        "avg_ks_score":     avg_ks,
+        "data_source":      data_source,
+        "recommendation":   "RETRAIN" if drifted > 0 else "STABLE",
+        "feature_results":  drift_results
+    }
+
+
+@app.post("/retrain")
+def retrain():
+    X = baseline[features]
+    y = baseline[target]
+    try:
+        sm = SMOTE(random_state=42)
+        Xr, yr = sm.fit_resample(X, y)
+    except Exception:
+        Xr, yr = X, y
+    new_model = RandomForestClassifier(n_estimators=10, random_state=42)
+    new_model.fit(Xr, yr)
+    y_prob  = new_model.predict_proba(X)[:, 1]
+    new_auc = round(roc_auc_score(y, y_prob), 4)
+    joblib.dump(new_model, "fraud_model.pkl")
+    return {
+        "status":  "retrained",
+        "new_auc": new_auc,
+        "message": "Model retrained successfully!"
+    }

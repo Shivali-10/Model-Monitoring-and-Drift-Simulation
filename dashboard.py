@@ -362,7 +362,7 @@ elif run_button:
             try:
                 smote = SMOTE(random_state=42)
                 X_sm, y_sm = smote.fit_resample(X_train, y_train)
-            except:
+            except ValueError:
                 X_sm, y_sm = X_train, y_train
 
             model = RandomForestClassifier(n_estimators=n_trees, random_state=42)
@@ -375,7 +375,7 @@ elif run_button:
                 y = data[target_column]
                 y_pred = model.predict(X)
                 try: auc = round(roc_auc_score(y, y_pred), 4)
-                except: auc = 0.5
+                except ValueError: auc = 0.5
                 f1  = round(f1_score(y, y_pred, average='weighted'), 4)
                 rec = round(recall_score(y, y_pred, average='weighted'), 4)
                 pre = round(precision_score(y, y_pred, average='weighted', zero_division=0), 4)
@@ -390,11 +390,11 @@ elif run_button:
             def retrain_on_week(data):
                 X = data.drop(target_column, axis=1); y = data[target_column]
                 try: Xr,yr = SMOTE(random_state=42).fit_resample(X,y)
-                except: Xr,yr = X,y
+                except ValueError: Xr,yr = X,y
                 nm = RandomForestClassifier(n_estimators=n_trees, random_state=42)
                 nm.fit(Xr,yr)
                 try: return round(roc_auc_score(y, nm.predict_proba(X)[:,1]), 4)
-                except: return 0.5
+                except ValueError: return 0.5
 
             auc2_new = retrain_on_week(week2_d)
             auc3_new = retrain_on_week(week3_d)

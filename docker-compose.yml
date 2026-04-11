@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  drift-api:
+    build: .
+    container_name: adaptive_drift_api
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+    env_file:
+      - .env
+    volumes:
+      - .:/app  # Live reload for local development
+    restart: unless-stopped
